@@ -1,0 +1,391 @@
+# FigVis
+
+```elixir
+Mix.install([
+  {:req, "~> 0.3.9"}
+])
+```
+
+## Section
+
+```elixir
+"mix xref graph --format dot"
+```
+
+## Utils
+
+```elixir
+defmodule Request do
+  def get!(url) do
+    build_request()
+    |> Req.get!(url: url)
+  end
+
+  def post!(url, data) do
+    build_request()
+    |> Req.post!(url: url, json: data)
+  end
+
+  defp build_request() do
+    access_token = access_token()
+
+    Req.new(
+      base_url: "https://api.miro.com/v2",
+      headers: [
+        authorization: "Bearer #{access_token}",
+        accept: "application/json",
+        content_type: "application/json"
+      ]
+    )
+  end
+
+  defp access_token() do
+    System.get_env("LB_MIRO_ACCESS_TOKEN")
+  end
+end
+```
+
+## Read & Parse Dot File
+
+```elixir
+defmodule Note do
+  defstruct [:id, :miro_id, :name, calls: []]
+end
+
+defmodule DotParser do
+  def parse(filepath) do
+    filepath
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.drop(1)
+    |> Enum.map(&parse_line/1)
+    |> Enum.reduce(%{}, fn line, notes ->
+      case line do
+        nil ->
+          notes
+
+        [calling_note_name, called_note_name] ->
+          notes
+          |> put_note(called_note_name)
+          |> put_note(calling_note_name, called_note_name)
+
+        [note] ->
+          put_note(notes, note)
+      end
+    end)
+    |> Map.values()
+  end
+
+  defp parse_line("digraph" <> _rest), do: nil
+  defp parse_line("}"), do: nil
+
+  defp parse_line(line) do
+    line
+    |> String.replace("\"", "")
+    |> String.replace(" ", "")
+    |> String.split("->", trim: true)
+  end
+
+  defp put_note(notes, note_name, called_note_name \\ nil)
+
+  defp put_note(notes, note_name, nil) do
+    {notes, _note} = get_or_create_note(notes, note_name)
+    notes
+  end
+
+  defp put_note(notes, note_name, called_note_name) do
+    {notes, note} = get_or_create_note(notes, note_name)
+    note = put_call(note, called_note_name, notes)
+    Map.put(notes, note_name, note)
+  end
+
+  defp get_or_create_note(notes, note_name) do
+    case Map.get(notes, note_name) do
+      nil ->
+        new_note = %Note{id: map_size(notes), name: note_name, calls: []}
+        notes = Map.put(notes, note_name, new_note)
+        {notes, new_note}
+
+      note ->
+        {notes, note}
+    end
+  end
+
+  defp put_call(%Note{calls: calls} = note, called_note_name, notes) do
+    called_note = Map.fetch!(notes, called_note_name)
+    Map.put(note, :calls, [called_note.id | calls])
+  end
+end
+```
+
+```elixir
+notes = DotParser.parse("./Development/ex_vis/xref_graph.dot")
+```
+
+## Setup Miro Board
+
+```elixir
+defmodule Miro do
+  @color %{
+    gray: "gray",
+    light_yellow: "light_yellow",
+    yellow: "yellow",
+    orange: "orange",
+    light_green: "light_green",
+    green: "green",
+    dark_green: "dark_green",
+    cyan: "cyan",
+    light_pink: "light_pink",
+    pink: "pink",
+    violet: "violet",
+    red: "red",
+    light_blue: "light_blue",
+    blue: "blue",
+    dark_blue: "dark_blue",
+    black: "black"
+  }
+
+  def color(), do: @color
+
+  def create_frame(board_id, name, pos_x, pos_y, frame_width, frame_height) do
+    url = "/boards/#{board_id}/frames"
+
+    data = %{
+      "data" => %{
+        "title" => name
+      },
+      "position" => %{
+        "origin" => "center",
+        "x" => pos_x,
+        "y" => pos_y
+      },
+      "geometry" => %{
+        "width" => frame_width,
+        "height" => frame_height
+      }
+    }
+
+    Request.post!(url, data)
+  end
+
+  def create_sticky_note(board_id, frame_miro_id, text, color, pos_x, pos_y, width) do
+    url = "/boards/#{board_id}/sticky_notes"
+
+    data = %{
+      "data" => %{
+        "content" => text,
+        "shape" => "square"
+      },
+      "style" => %{
+        "fillColor" => color
+      },
+      "position" => %{
+        "origin" => "center",
+        "x" => pos_x,
+        "y" => pos_y
+      },
+      "geometry" => %{
+        "width" => width
+      },
+      "parent" => %{
+        "id" => frame_miro_id
+      }
+    }
+
+    Request.post!(url, data)
+  end
+end
+```
+
+```elixir
+# Groups will be created in order. Modules will be put into the first group that
+# matches their name. So, changing the order of the groups might change the group
+# into which some modules fall.
+groups = [
+  {~r/tasks\//, Miro.color().orange},
+  {~r/test\//, Miro.color().cyan},
+  {~r/router*/, Miro.color().green},
+  {~r/channel*/, Miro.color().blue},
+  {~r/endpoint*/, Miro.color().light_green},
+  {~r/transports\//, Miro.color().violet},
+  {~r/socket*/, Miro.color().red},
+  {~r/mix\//, Miro.color().red},
+  # Required! 
+  # The Default Group for all modules that don't match any other group.
+  {~r/./, Miro.color().gray}
+]
+```
+
+```elixir
+defmodule Grouper do
+  def group(notes, groups) do
+    groups_with_id =
+      groups |> Enum.with_index(0) |> Enum.map(fn {group, id} -> {id, group} end) |> Map.new()
+
+    group_keys = Enum.map(groups_with_id, fn {id, {regex, _color}} -> {id, regex} end)
+
+    Enum.reduce(notes, %{}, fn note, groups ->
+      matched_group =
+        Enum.find(group_keys, fn {_group_id, regex} -> String.match?(note.name, regex) end)
+
+      {matched_group_id, _regex} = matched_group
+      prepend_node(groups, matched_group_id, note)
+    end)
+  end
+
+  defp prepend_node(groups, group_id, node) do
+    Map.update(groups, group_id, [node], fn nodes -> [node | nodes] end)
+  end
+end
+```
+
+```elixir
+grouped_notes = Grouper.group(notes, groups)
+```
+
+```elixir
+defmodule Frame do
+  defstruct [:miro_id, :title, :group_id, :notes, :pos_x, :pos_y, :width, :height]
+end
+
+defmodule Painter do
+  # All measures are in pixel
+  @note_width 200
+  # Note Height is only assumed. Miro calculates the height
+  # based on an aspect ratio depending on the width. Usually,
+  # the height is 230 if the width is 200 though.
+  @note_height 230
+  @note_gap_x 30
+  @note_gap_y 20
+
+  @frame_width 2000
+  @frame_gap_x 200
+  @frame_gap_y 500
+
+  # Max number of Frames to create vertically
+  # before we create a new column of frames.
+  @max_frame_count_y 3
+  @max_note_count_x 8
+
+  def create_groups(board_id, grouped_notes, groups) do
+    frames = create_frames(board_id, grouped_notes, groups)
+    Enum.map(frames, fn frame -> create_notes(board_id, frame, groups) end)
+  end
+
+  defp create_frames(board_id, grouped_notes, groups) do
+    Enum.reduce(grouped_notes, {[], 0, 0}, fn {group_id, notes}, {frames, pos_x, pos_y} ->
+      title = format_frame_title(groups, group_id)
+      frame_height = calc_frame_height(notes)
+      miro_frame = Miro.create_frame(board_id, title, pos_x, pos_y, @frame_width, frame_height)
+
+      miro_id = miro_frame.body["id"]
+
+      frame = %Frame{
+        miro_id: miro_id,
+        group_id: group_id,
+        notes: notes,
+        title: title,
+        pos_x: pos_x,
+        pos_y: pos_y,
+        width: @frame_width,
+        height: frame_height
+      }
+
+      frames = [frame | frames]
+
+      {next_pos_x, next_pos_y} =
+        if vertical_frame_count_reached?(frames) do
+          next_pos_x = pos_x + @frame_width + @frame_gap_x
+          next_pos_y = 0
+          {next_pos_x, next_pos_y}
+        else
+          {pos_x, pos_y + frame_height + @frame_gap_y}
+        end
+
+      {frames, next_pos_x, next_pos_y}
+    end)
+    |> elem(0)
+  end
+
+  defp create_notes(board_id, frame, groups) do
+    color = get_group_color(groups, frame.group_id)
+
+    # Miro uses the top-left corner of the parent (frame)
+    # to draw the sticky note. So, the position x: 0, y: 0
+    # is exactly on the top-left corner.
+    # So, we need to move the starting position down
+    # by half a note.
+    start_pos_x = div(@note_width, 2)
+    start_pos_y = div(@note_height, 2) + @note_gap_y
+
+    notes =
+      Enum.reduce(frame.notes, {[], start_pos_x, start_pos_y}, fn note, {notes, pos_x, pos_y} ->
+        miro_note =
+          Miro.create_sticky_note(
+            board_id,
+            frame.miro_id,
+            note.name,
+            color,
+            pos_x,
+            pos_y,
+            @note_width
+          )
+
+        miro_id = miro_note.body["id"]
+        note = Map.put(note, :miro_id, miro_id)
+        notes = [note | notes]
+
+        {next_pos_x, next_pos_y} =
+          if horizontal_note_count_reached?(notes) do
+            next_pos_x = start_pos_x
+            next_pos_y = pos_y + @note_height + @note_gap_y
+            {next_pos_x, next_pos_y}
+          else
+            next_pos_x = pos_x + @note_width + @note_gap_x
+            next_pos_y = pos_y
+            {next_pos_x, next_pos_y}
+          end
+
+        {notes, next_pos_x, next_pos_y}
+      end)
+      |> elem(0)
+
+    Map.put(frame, :notes, notes)
+  end
+
+  defp format_frame_title(groups, group_id) do
+    groups |> Enum.at(group_id) |> elem(0) |> Regex.source()
+  end
+
+  defp get_group_color(groups, group_id) do
+    groups |> Enum.at(group_id) |> elem(1)
+  end
+
+  defp calc_frame_height(notes) do
+    note_count = length(notes)
+    row_count = ceil(note_count / @max_note_count_x)
+    row_count * (@note_height + @note_gap_y * 2)
+  end
+
+  defp vertical_frame_count_reached?(frames) do
+    length(frames) > 0 && rem(length(frames), @max_frame_count_y) == 0
+  end
+
+  defp horizontal_note_count_reached?(notes) do
+    note_count = length(notes)
+    note_count > 0 && rem(note_count, @max_note_count_x) == 0
+  end
+end
+```
+
+```elixir
+board_id = "uXjVM_D3csY="
+# grouped_notes = Map.take(grouped_notes, [0, 1, 2])
+frames = Painter.create_groups(board_id, grouped_notes, groups)
+```
+
+```elixir
+div(230, 2)
+```
+
+<!-- livebook:{"offset":9360,"stamp":{"token":"QTEyOEdDTQ.z8yPOvEGy9rEgGh3rOTf0_bPI0Wyqq-Lo_eY8x7NHkRMwqWnLaZ7XjecIf8.smiTVo0rDgFRurrj.mEaUxwbbn0wJT0m0cF0-Zlj1wDJ8yRbVnF_fHaiAnk57TOeVc_2DiEvrVLUSEAw470eQsjg.K1eyRqjsaNsr2BUURYmNNg","version":1}} -->
