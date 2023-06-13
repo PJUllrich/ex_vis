@@ -1,9 +1,18 @@
 # FigVis
 
 ```elixir
-Mix.install([
-  {:req, "~> 0.3.9"}
-])
+Mix.install(
+  [
+    {:req, "~> 0.3.9"},
+    {:hammer, "~> 6.1"}
+  ],
+  config: [
+    hammer: [
+      backend:
+        {Hammer.Backend.ETS, [expiry_ms: 60_000 * 60 * 4, cleanup_interval_ms: 60_000 * 10]}
+    ]
+  ]
+)
 ```
 
 ## Section
@@ -16,13 +25,19 @@ Mix.install([
 
 ```elixir
 defmodule Request do
+  require Logger
+
+  @max_requests_per_minute 900
+
   def get!(url) do
     build_request()
+    |> check_rate_limit()
     |> Req.get!(url: url)
   end
 
   def post!(url, data) do
     build_request()
+    |> check_rate_limit()
     |> Req.post!(url: url, json: data)
   end
 
@@ -37,6 +52,18 @@ defmodule Request do
         content_type: "application/json"
       ]
     )
+  end
+
+  defp check_rate_limit(request) do
+    case Hammer.check_rate("request", 60_000, @max_requests_per_minute) do
+      {:allow, _count} ->
+        request
+
+      {:deny, _limit} ->
+        Logger.info("Request Limit reached. Waiting 1s.")
+        :timer.sleep(1_000)
+        check_rate_limit(request)
+    end
   end
 
   defp access_token() do
@@ -118,10 +145,6 @@ defmodule DotParser do
 end
 ```
 
-```elixir
-notes = DotParser.parse("./Development/ex_vis/xref_graph.dot")
-```
-
 ## Setup Miro Board
 
 ```elixir
@@ -145,7 +168,27 @@ defmodule Miro do
     black: "black"
   }
 
+  @hex_codes %{
+    gray: "#F5F6F8",
+    light_yellow: "#FFF9B1",
+    yellow: "#F5D027",
+    orange: "#FE9D47",
+    light_green: "#D4F692",
+    green: "#C9DE55",
+    dark_green: "#93D174",
+    cyan: "#67C6BF",
+    light_pink: "#FECEDF",
+    pink: "#F0929D",
+    violet: "#EA94BA",
+    red: "#F14725",
+    light_blue: "#A6CCF5",
+    blue: "#6CD7FA",
+    dark_blue: "#9EA9FF",
+    black: "#000000"
+  }
+
   def color(), do: @color
+  def hex_code(color), do: Map.fetch!(@hex_codes, color)
 
   def create_frame(board_id, name, pos_x, pos_y, frame_width, frame_height) do
     url = "/boards/#{board_id}/frames"
@@ -194,26 +237,26 @@ defmodule Miro do
 
     Request.post!(url, data)
   end
-end
-```
 
-```elixir
-# Groups will be created in order. Modules will be put into the first group that
-# matches their name. So, changing the order of the groups might change the group
-# into which some modules fall.
-groups = [
-  {~r/tasks\//, Miro.color().orange},
-  {~r/test\//, Miro.color().cyan},
-  {~r/router*/, Miro.color().green},
-  {~r/channel*/, Miro.color().blue},
-  {~r/endpoint*/, Miro.color().light_green},
-  {~r/transports\//, Miro.color().violet},
-  {~r/socket*/, Miro.color().red},
-  {~r/mix\//, Miro.color().red},
-  # Required! 
-  # The Default Group for all modules that don't match any other group.
-  {~r/./, Miro.color().gray}
-]
+  def create_connector(board_id, start_item_id, end_item_id, color) do
+    url = "/boards/#{board_id}/connectors"
+
+    data = %{
+      "startItem" => %{
+        "id" => start_item_id
+      },
+      "endItem" => %{
+        "id" => end_item_id
+      },
+      "style" => %{
+        "strokeWidth" => "2",
+        "strokeColor" => color
+      }
+    }
+
+    Request.post!(url, data)
+  end
+end
 ```
 
 ```elixir
@@ -240,12 +283,19 @@ end
 ```
 
 ```elixir
-grouped_notes = Grouper.group(notes, groups)
-```
-
-```elixir
 defmodule Frame do
-  defstruct [:miro_id, :title, :group_id, :notes, :pos_x, :pos_y, :width, :height]
+  defstruct [
+    :miro_id,
+    :title,
+    :color,
+    :group_id,
+    :notes,
+    :connectors,
+    :pos_x,
+    :pos_y,
+    :width,
+    :height
+  ]
 end
 
 defmodule Painter do
@@ -267,14 +317,16 @@ defmodule Painter do
   @max_frame_count_y 3
   @max_note_count_x 8
 
-  def create_groups(board_id, grouped_notes, groups) do
+  def create_all(board_id, grouped_notes, groups) do
     frames = create_frames(board_id, grouped_notes, groups)
-    Enum.map(frames, fn frame -> create_notes(board_id, frame, groups) end)
+    frames = create_notes(board_id, frames)
+    create_connectors(board_id, frames)
   end
 
-  defp create_frames(board_id, grouped_notes, groups) do
+  def create_frames(board_id, grouped_notes, groups) do
     Enum.reduce(grouped_notes, {[], 0, 0}, fn {group_id, notes}, {frames, pos_x, pos_y} ->
       title = format_frame_title(groups, group_id)
+      color = get_group_color(groups, group_id)
       frame_height = calc_frame_height(notes)
       miro_frame = Miro.create_frame(board_id, title, pos_x, pos_y, @frame_width, frame_height)
 
@@ -283,6 +335,7 @@ defmodule Painter do
       frame = %Frame{
         miro_id: miro_id,
         group_id: group_id,
+        color: color,
         notes: notes,
         title: title,
         pos_x: pos_x,
@@ -307,9 +360,11 @@ defmodule Painter do
     |> elem(0)
   end
 
-  defp create_notes(board_id, frame, groups) do
-    color = get_group_color(groups, frame.group_id)
+  def create_notes(board_id, frames) do
+    Enum.map(frames, fn frame -> do_create_notes(board_id, frame) end)
+  end
 
+  defp do_create_notes(board_id, frame) do
     # Miro uses the top-left corner of the parent (frame)
     # to draw the sticky note. So, the position x: 0, y: 0
     # is exactly on the top-left corner.
@@ -325,7 +380,7 @@ defmodule Painter do
             board_id,
             frame.miro_id,
             note.name,
-            color,
+            frame.color,
             pos_x,
             pos_y,
             @note_width
@@ -351,6 +406,33 @@ defmodule Painter do
       |> elem(0)
 
     Map.put(frame, :notes, notes)
+  end
+
+  def create_connectors(board_id, frames) do
+    all_notes =
+      frames
+      |> Enum.reduce([], fn frame, acc -> frame.notes ++ acc end)
+      |> Enum.map(fn note -> {note.id, note} end)
+      |> Map.new()
+
+    Enum.map(frames, fn frame ->
+      connectors =
+        for note <- frame.notes do
+          do_create_connectors(board_id, frame, note, note.calls, all_notes)
+        end
+
+      Map.put(frame, :connectors, connectors)
+    end)
+  end
+
+  defp do_create_connectors(_board_id, _frame, _note, [], _all_notes), do: :ok
+
+  defp do_create_connectors(board_id, frame, note, calls, all_notes) do
+    for call <- calls do
+      end_note = Map.fetch!(all_notes, call)
+      color = Miro.hex_code(frame.color)
+      Miro.create_connector(board_id, note.miro_id, end_note.miro_id, color)
+    end
   end
 
   defp format_frame_title(groups, group_id) do
@@ -380,12 +462,31 @@ end
 
 ```elixir
 board_id = "uXjVM_D3csY="
-# grouped_notes = Map.take(grouped_notes, [0, 1, 2])
-frames = Painter.create_groups(board_id, grouped_notes, groups)
+dot_file_path = "./Development/ex_vis/xref_graph.dot"
+
+# Groups will be created in order. Modules will be put into the first group that
+# matches their name. So, changing the order of the groups might change the group
+# into which some modules fall.
+groups = [
+  {~r/tasks\//, :orange},
+  {~r/test\//, :cyan},
+  {~r/router*/, :green},
+  {~r/channel*/, :blue},
+  {~r/endpoint*/, :cyan},
+  {~r/transports\//, :violet},
+  {~r/socket*/, :red},
+  {~r/mix\//, :yellow},
+  # Required! 
+  # The Default Group for all modules that don't match any other group.
+  {~r/./, :gray}
+]
+
+notes = DotParser.parse(dot_file_path)
+grouped_notes = Grouper.group(notes, groups)
 ```
 
 ```elixir
-div(230, 2)
+Painter.create_all(board_id, grouped_notes, groups)
 ```
 
-<!-- livebook:{"offset":9360,"stamp":{"token":"QTEyOEdDTQ.z8yPOvEGy9rEgGh3rOTf0_bPI0Wyqq-Lo_eY8x7NHkRMwqWnLaZ7XjecIf8.smiTVo0rDgFRurrj.mEaUxwbbn0wJT0m0cF0-Zlj1wDJ8yRbVnF_fHaiAnk57TOeVc_2DiEvrVLUSEAw470eQsjg.K1eyRqjsaNsr2BUURYmNNg","version":1}} -->
+<!-- livebook:{"offset":11602,"stamp":{"token":"QTEyOEdDTQ.wU5pAcMnWDXnBsLWTKp5JNfbqdZuICEHjztzTnENNKp5_DadaTOzbIpHmCo.g8E09fK3dnkRP1qu.sLIVraavphFc2jaGrQkBxVRFtX4S1e3-NqjgqED-zAVgSxjrUAjSSPg01xT4VpLmH3-oaKA.xbI5sPgzS-2ClBfIUOqHDA","version":1}} -->
